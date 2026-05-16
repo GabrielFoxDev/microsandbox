@@ -270,11 +270,17 @@ impl SandboxHandle {
         }
 
         let pid = self.pid.filter(|pid| super::pid_is_alive(*pid));
+        // Tracks whether we issued a SIGKILL. After SIGKILL the process is
+        // guaranteed dead by kernel time; `pid_is_alive` still returns true
+        // during the zombie window before the parent's `waitpid`, so we
+        // can't rely on it to gate the DB update.
+        let mut sigkilled = false;
 
         if timeout.is_zero() {
             // Skip graceful path — caller asked for immediate kill.
             let pids = signal_pid(self.pid, nix::sys::signal::Signal::SIGKILL)?;
             if !pids.is_empty() {
+                sigkilled = true;
                 wait_for_exit(&pids, std::time::Duration::from_secs(5)).await;
             }
         } else {
@@ -291,6 +297,7 @@ impl SandboxHandle {
                         "graceful stop exceeded timeout, escalating to SIGKILL"
                     );
                     let _ = signal_pid(self.pid, nix::sys::signal::Signal::SIGKILL)?;
+                    sigkilled = true;
                     wait_for_exit(&[pid], std::time::Duration::from_secs(5)).await;
                 }
             }
@@ -298,8 +305,10 @@ impl SandboxHandle {
 
         // Idempotent with the VMM exit observer (vm.rs build_vm): on a clean
         // poweroff the observer already wrote Stopped; this just covers paths
-        // where the observer didn't get to run (e.g., SIGKILL escalation).
-        let all_dead = pid.map(|p| !super::pid_is_alive(p)).unwrap_or(true);
+        // where the observer didn't get to run (e.g., SIGKILL escalation, or
+        // a sandbox owned by a foreign process). After SIGKILL we trust the
+        // kernel and don't poll the zombie window.
+        let all_dead = sigkilled || pid.map(|p| !super::pid_is_alive(p)).unwrap_or(true);
         if all_dead {
             let db = crate::db::init_global().await?.write();
             if let Err(e) =

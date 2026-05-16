@@ -36,6 +36,15 @@ const EXIT_REASON_IDLE_TIMEOUT: u8 = 1;
 const EXIT_REASON_MAX_DURATION: u8 = 2;
 const EXIT_REASON_SIGNAL: u8 = 3;
 
+/// How long the host waits after forwarding a `core.shutdown` frame to
+/// agentd before triggering its own exit fallback.
+///
+/// agentd uses this window to `sync()` block-backed root filesystems
+/// and power off the kernel cleanly. On a healthy guest the VMM exits
+/// on its own well before this elapses; the host trigger only fires
+/// when the guest is wedged.
+const SHUTDOWN_FLUSH_GRACE: Duration = Duration::from_secs(3);
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -458,6 +467,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
 
     // Spawn background tasks.
     let (_relay_shutdown_tx, relay_shutdown_rx) = tokio::sync::watch::channel(false);
+    let (relay_drain_tx, mut relay_drain_rx) = tokio::sync::mpsc::channel::<()>(1);
 
     // Relay: spawn a blocking task for wait_ready, then run the accept loop.
     // wait_ready() must run AFTER enter() starts the VM (agentd sends core.ready),
@@ -468,7 +478,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
 
         match ready_result {
             Ok(Ok(relay)) => {
-                if let Err(e) = relay.run(relay_shutdown_rx).await {
+                if let Err(e) = relay.run(relay_shutdown_rx, relay_drain_tx).await {
                     tracing::error!("agent relay error: {e}");
                 }
             }
@@ -476,6 +486,25 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             Err(e) => tracing::error!("agent relay wait_ready task panicked: {e}"),
         }
     });
+
+    // Shutdown listener: when the relay forwards a `core.shutdown` frame to
+    // agentd, we give the guest a window to flush block-backed roots and
+    // power off cleanly. If the VM doesn't exit on its own within
+    // `SHUTDOWN_FLUSH_GRACE`, the host triggers exit as a fallback so a
+    // wedged guest doesn't strand the VMM.
+    {
+        let shutdown_exit_handle = exit_handle.clone();
+        tokio_rt.spawn(async move {
+            if relay_drain_rx.recv().await.is_some() {
+                tracing::info!(
+                    "core.shutdown forwarded to agentd, allowing flush grace before host fallback"
+                );
+                tokio::time::sleep(SHUTDOWN_FLUSH_GRACE).await;
+                tracing::info!("flush grace elapsed, triggering host exit");
+                shutdown_exit_handle.trigger();
+            }
+        });
+    }
 
     // Heartbeat/idle timeout monitor.
     if let Some(idle_secs) = config.idle_timeout_secs {
