@@ -114,7 +114,7 @@ The SDK lets you create and control sandboxes directly from your application. `S
 >
 >     println!("{}", output.stdout()?);
 >
->     sandbox.stop_and_wait().await?;
+>     sandbox.stop().await?;
 >
 >     Ok(())
 > }
@@ -139,7 +139,7 @@ The SDK lets you create and control sandboxes directly from your application. `S
 >
 >     print(output.stdout_text)
 >
->     await sandbox.stop_and_wait()
+>     await sandbox.stop()
 >
 > asyncio.run(main())
 > ```
@@ -195,7 +195,7 @@ The SDK lets you create and control sandboxes directly from your application. `S
 >     if err != nil {
 >         log.Fatal(err)
 >     }
->     defer sandbox.StopAndWait(ctx)
+>     defer sandbox.Stop(ctx)
 >
 >     output, err := sandbox.Exec(ctx, "python", []string{"-c", "print('Hello from a microVM!')"})
 >     if err != nil {
