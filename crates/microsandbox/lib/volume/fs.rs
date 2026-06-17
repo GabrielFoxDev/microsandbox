@@ -433,8 +433,10 @@ pub(crate) mod local {
         path: &str,
         recursive: bool,
     ) -> MicrosandboxResult<()> {
-        let full = resolve(local, name, path)?;
+        let root = volume_root(local, name);
+        let full = resolve_relative(&root, path)?;
         if recursive {
+            ensure_not_volume_root(&root, &full, "remove_dir")?;
             tokio::fs::remove_dir_all(&full).await?;
         } else {
             tokio::fs::remove_file(&full).await?;
@@ -522,6 +524,23 @@ pub(crate) mod local {
     // Functions: helpers
     //----------------------------------------------------------------------------------------------
 
+    fn ensure_not_volume_root(root: &Path, path: &Path, operation: &str) -> MicrosandboxResult<()> {
+        let canon_root = if root.exists() {
+            root.canonicalize()
+                .map_err(|e| MicrosandboxError::SandboxFsOps(format!("resolve root: {e}")))?
+        } else {
+            root.to_path_buf()
+        };
+
+        if path == canon_root {
+            return Err(MicrosandboxError::SandboxFsOps(format!(
+                "{operation} cannot target the volume root"
+            )));
+        }
+
+        Ok(())
+    }
+
     fn std_kind(meta: &std::fs::Metadata) -> FsEntryKind {
         if meta.is_file() {
             FsEntryKind::File
@@ -571,5 +590,81 @@ pub(crate) mod local {
             modified: std_modified(meta),
             created: std_created(meta),
         }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::LocalBackend;
+
+    #[tokio::test]
+    async fn remove_dir_rejects_slash_volume_root() {
+        let (_temp, backend) = local_backend().await;
+        local::write(&backend, "vol", "nested/file.txt", b"data")
+            .await
+            .unwrap();
+        let root = backend.volume_path("vol");
+
+        let err = local::remove(&backend, "vol", "/", true).await.unwrap_err();
+
+        assert!(
+            err.to_string().contains("volume root"),
+            "unexpected error: {err}"
+        );
+        assert!(root.is_dir());
+        assert!(root.join("nested/file.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn remove_dir_rejects_empty_volume_root() {
+        let (_temp, backend) = local_backend().await;
+        local::write(&backend, "vol", "nested/file.txt", b"data")
+            .await
+            .unwrap();
+        let root = backend.volume_path("vol");
+
+        let err = local::remove(&backend, "vol", "", true).await.unwrap_err();
+
+        assert!(
+            err.to_string().contains("volume root"),
+            "unexpected error: {err}"
+        );
+        assert!(root.is_dir());
+        assert!(root.join("nested/file.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn remove_dir_removes_child_directory() {
+        let (_temp, backend) = local_backend().await;
+        local::write(&backend, "vol", "nested/file.txt", b"data")
+            .await
+            .unwrap();
+        let root = backend.volume_path("vol");
+
+        local::remove(&backend, "vol", "nested", true)
+            .await
+            .unwrap();
+
+        assert!(root.is_dir());
+        assert!(!root.join("nested").exists());
+    }
+
+    async fn local_backend() -> (tempfile::TempDir, LocalBackend) {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::builder()
+            .home(temp.path())
+            .build()
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(backend.volume_path("vol"))
+            .await
+            .unwrap();
+
+        (temp, backend)
     }
 }
